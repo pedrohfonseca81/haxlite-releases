@@ -1,0 +1,154 @@
+name: build
+
+# Builds a tagged haxlite version and publishes it here. The source stays in the private
+# repo: each job downloads it with SOURCE_TOKEN onto the temporary runner, nothing of it is
+# committed here. Started by hand (or `gh workflow run build.yml -f tag=vX.Y.Z`); there is
+# no push/pull_request trigger, so nobody else can run it or read its secrets.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag in the private repo (vX.Y.Z or vX.Y.Z-beta.N)"
+        required: true
+
+concurrency:
+  group: build-${{ inputs.tag }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  PROFILE: release
+  HAXLITE_UPDATER: "1"
+  VERSION: ${{ inputs.tag }}
+  # these logs are public: compiler warnings would quote source lines
+  RUSTFLAGS: -Awarnings
+
+jobs:
+  linux:
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-24.04, target: x86_64-unknown-linux-gnu, plat: linux-x86_64 }
+          - { runner: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, plat: linux-arm64 }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { repository: pedrohfonseca81/haxlite, ref: "${{ inputs.tag }}", token: "${{ secrets.SOURCE_TOKEN }}" }
+      - uses: dtolnay/rust-toolchain@stable
+        with: { targets: "${{ matrix.target }}" }
+      - uses: Swatinem/rust-cache@v2
+        with: { key: "${{ matrix.target }}" }
+      - name: System packages
+        timeout-minutes: 12
+        run: |
+          if [ "$(dpkg --print-architecture)" = arm64 ]; then
+            printf '%s\tpriority:%s\n' https://mirrors.ocf.berkeley.edu/ubuntu-ports/ 1 \
+              http://ports.ubuntu.com/ubuntu-ports/ 2 > /tmp/mirrors.txt
+          else
+            printf '%s\tpriority:%s\n' https://mirrors.edge.kernel.org/ubuntu/ 1 \
+              http://archive.ubuntu.com/ubuntu/ 2 http://azure.archive.ubuntu.com/ubuntu/ 3 > /tmp/mirrors.txt
+          fi
+          sudo cp /tmp/mirrors.txt /etc/apt/haxlite-mirrors.txt
+          sudo sed -i -E 's#^URIs:.*(ubuntu\.com|apt-mirrors).*#URIs: mirror+file:/etc/apt/haxlite-mirrors.txt#' \
+            /etc/apt/sources.list.d/ubuntu.sources
+          apt="-o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 -o DPkg::Lock::Timeout=60"
+          for i in 1 2 3; do
+            sudo timeout 240 apt-get $apt update && sudo timeout 420 apt-get $apt install -y --no-install-recommends \
+              pkg-config g++ qt6-webengine-dev libxkbcommon-dev libwayland-dev libx11-dev && exit 0
+            echo "apt attempt $i failed, retrying"; sleep 10
+          done
+          exit 1
+      - run: cargo build --profile $PROFILE --locked --target ${{ matrix.target }}
+      - run: scripts/package.sh linux "$VERSION" ${{ matrix.target }}
+      - uses: actions/upload-artifact@v4
+        with: { name: "dist-${{ matrix.plat }}", path: dist/*.tar.gz }
+      - uses: actions/upload-artifact@v4
+        with: { name: "upd-${{ matrix.plat }}", path: dist/update }
+
+  windows:
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-pc-windows-msvc, plat: windows-x86_64 }
+          - { target: aarch64-pc-windows-msvc, plat: windows-arm64 }
+    runs-on: windows-latest
+    defaults:
+      run: { shell: bash }
+    steps:
+      - uses: actions/checkout@v4
+        with: { repository: pedrohfonseca81/haxlite, ref: "${{ inputs.tag }}", token: "${{ secrets.SOURCE_TOKEN }}" }
+      - uses: dtolnay/rust-toolchain@stable
+        with: { targets: "${{ matrix.target }}" }
+      - uses: Swatinem/rust-cache@v2
+        with: { key: "${{ matrix.target }}" }
+      - run: cargo build --profile $PROFILE --locked --target ${{ matrix.target }}
+      - run: scripts/package.sh windows "$VERSION" ${{ matrix.target }}
+      - uses: actions/upload-artifact@v4
+        with: { name: "dist-${{ matrix.plat }}", path: dist/*.zip }
+      - uses: actions/upload-artifact@v4
+        with: { name: "upd-${{ matrix.plat }}", path: dist/update }
+
+  macos:
+    timeout-minutes: 40
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+        with: { repository: pedrohfonseca81/haxlite, ref: "${{ inputs.tag }}", token: "${{ secrets.SOURCE_TOKEN }}" }
+      - uses: dtolnay/rust-toolchain@stable
+        with: { targets: "aarch64-apple-darwin,x86_64-apple-darwin" }
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --profile $PROFILE --locked --target aarch64-apple-darwin
+      - run: cargo build --profile $PROFILE --locked --target x86_64-apple-darwin
+      - run: scripts/package.sh macos "$VERSION" aarch64-apple-darwin x86_64-apple-darwin
+      - uses: actions/upload-artifact@v4
+        with: { name: dist-macos-universal, path: dist/*.dmg }
+      - uses: actions/upload-artifact@v4
+        with: { name: upd-macos, path: dist/update }
+
+  publish:
+    needs: [linux, windows, macos]
+    runs-on: ubuntu-24.04
+    permissions: { contents: write }
+    steps:
+      - uses: actions/checkout@v4
+        with: { repository: pedrohfonseca81/haxlite, ref: "${{ inputs.tag }}", token: "${{ secrets.SOURCE_TOKEN }}" }
+      - name: Tag matches Cargo.toml
+        run: |
+          v=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          [ "v$v" = "$VERSION" ] || { echo "tag $VERSION but Cargo.toml says $v"; exit 1; }
+      - name: Release notes (annotated tag message)
+        run: |
+          git fetch --force origin "+refs/tags/$VERSION:refs/tags/$VERSION"
+          git tag -l --format='%(contents)' "$VERSION" > notes.txt
+          cat notes.txt
+      - uses: actions/download-artifact@v4
+        with: { pattern: "dist-*", path: dist, merge-multiple: true }
+      - uses: actions/download-artifact@v4
+        with: { pattern: "upd-*", path: upd, merge-multiple: true }
+      - name: Signed manifest
+        id: manifest
+        env: { UPDATE_SIGNING_KEY: "${{ secrets.UPDATE_SIGNING_KEY }}" }
+        run: |
+          pip install --quiet cryptography
+          find upd -type f | sort
+          python3 scripts/update_manifest.py --tag "$VERSION" --upd upd --notes notes.txt --out out
+      - name: Publish
+        env:
+          GH_TOKEN: "${{ github.token }}"
+          CHANNEL: "${{ steps.manifest.outputs.channel }}"
+        run: |
+          repo=${{ github.repository }}
+          pre=""; [ "$CHANNEL" = beta ] && pre="--prerelease"
+          (cd dist && sha256sum * > SHA256SUMS.txt)
+          grep -v -i '^min-version:' notes.txt > public-notes.txt || true
+          gh release create "$VERSION" -R $repo $pre --target main --title "haxlite $VERSION" \
+            --notes-file public-notes.txt dist/* out/assets/*
+          gh release view manifest -R $repo >/dev/null 2>&1 || gh release create manifest -R $repo --prerelease \
+            --title "Update manifest" --notes "Signed update manifests read by haxlite. Not a version to download."
+          gh release upload manifest -R $repo --clobber "out/$CHANNEL.json" "out/$CHANNEL.json.sig"

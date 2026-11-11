@@ -145,7 +145,9 @@ jobs:
         run: |
           repo=${{ github.repository }}
           pre=""; [ "$CHANNEL" = beta ] && pre="--prerelease"
-          (cd dist && sha256sum * > SHA256SUMS.txt)
+          # copies without the version: .../releases/latest/download/haxlite-windows-x86_64.zip
+          # is then a link that always serves the newest version
+          (cd dist && for f in haxlite-"$VERSION"-*; do cp "$f" "${f/-$VERSION/}"; done && sha256sum * > SHA256SUMS.txt)
           grep -v -i '^min-version:' notes.txt > public-notes.txt || true
           gh release create "$VERSION" -R $repo $pre --target main --title "haxlite $VERSION" \
             --notes-file public-notes.txt dist/* out/assets/*
